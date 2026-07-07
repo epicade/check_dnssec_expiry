@@ -22,6 +22,7 @@
 # * Resolved min/max RRSIG evaluation bugs to ensure safe monitoring during key rollovers.
 # * Added verbose (-v) logging and inline command-debugging output for Nagios alerts.
 # * added status code of dig to monitoring one liner
+# * added ad flag validation is the answer dnssec signed?
 
 # Default values
 warning="10d"
@@ -159,13 +160,22 @@ else
 fi
 log_verbose "Resolver answered with status: ${client_status}."
 
-checkDomainResolvableWithDnssecEnabledResolver=$(echo "$raw_rec_output" | grep -v "^;" | grep -v "^$" | grep -v "RRSIG")
+# Parse flags and check if answer is dnssec signed at all
+# we are searching for the ad flag in the header
+answerFlags=$(echo "$raw_rec_output" | sed -n -e 's/^;; flags: \([^;]\+\);.*/\1/p')
+log_verbose "Found the following flags in header: $answerFlags"
 
-if [[ -z $checkDomainResolvableWithDnssecEnabledResolver ]]; then
+# Parse output (like dig +short)
+checkDomainResolvableWithDnssecEnabledResolver=$(echo "$raw_rec_output" | grep -v -e "^;" -e "^$" -e "RRSIG")
+
+# If no data was returned OR the status is not NOERROR
+if [[ -z "$checkDomainResolvableWithDnssecEnabledResolver" ]] || [[ "$client_status" != 'NOERROR' ]]; then
+
+    # Fallback test: Does it work without DNSSEC validation (+cd)?
     cmd_resolve_cd="dig +short @${resolver} $recordType $zone +cd"
     checkDomainResolvableWithDnssecValidationExplicitelyDisabled=$($cmd_resolve_cd)
 
-    if [[ ! -z $checkDomainResolvableWithDnssecValidationExplicitelyDisabled ]]; then
+    if [[ -n "$checkDomainResolvableWithDnssecValidationExplicitelyDisabled" ]]; then
         echo "CRITICAL: The domain $zone can be resolved without DNSSEC (+cd), but fails with validation! (Resolver status with validation: $client_status) [Cmd: $cmd_resolve]"
         exit 2
     else
@@ -174,14 +184,24 @@ if [[ -z $checkDomainResolvableWithDnssecEnabledResolver ]]; then
     fi
 fi
 
-# Check if the domain is DNSSEC signed at all
-cmd_signed="dig $zone @$resolver DS +short"
-log_verbose "Checking if zone is signed: $cmd_signed"
-checkZoneItselfIsSignedAtAll=$($cmd_signed)
+# If the script reaches this point, we know: Status is NOERROR and data was returned.
+if [[ " $answerFlags " == *" ad "* ]]; then
+    log_verbose "Answer is dnssec signed. Found (ad) flag in HEADER."
+else
+    log_verbose "Answer is not dnssec signed (missing 'ad' flag). Checking for DS record to find out why..."
 
-if [[ -z $checkZoneItselfIsSignedAtAll ]]; then
-    echo "WARNING: Zone $zone seems to be unsigned (No DS found). [Cmd: $cmd_signed]"
-    exit 1
+    # Check if the domain is DNSSEC signed at all (has a DS record)
+    cmd_signed="dig $zone @$resolver DS +short"
+    checkZoneItselfIsSignedAtAll=$($cmd_signed)
+
+    if [[ -z "$checkZoneItselfIsSignedAtAll" ]]; then
+        log_verbose "Answer is missing ad flag becuase zone is unsigned."
+        echo "WARNING: Zone $zone seems to be unsigned (No DS found). [Cmd: $cmd_signed]"
+        exit 1
+    else
+        echo "WARNING: The domain $zone has a DS record, but the resolver did not set the 'ad' flag! Possible resolver or path misconfiguration or NTA (Negative Trust Anchor) is set for zone. (Resolver status: $client_status) [Cmd: $cmd_resolve]"
+        exit 1
+    fi
 fi
 
 # ==============================================================================

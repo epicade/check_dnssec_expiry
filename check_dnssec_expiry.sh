@@ -23,6 +23,7 @@
 # * Added verbose (-v) logging and inline command-debugging output for Nagios alerts.
 # * added status code of dig to monitoring one liner
 # * added ad flag validation is the answer dnssec signed?
+# * added anycast node debug messasge
 
 # Default values
 warning="10d"
@@ -31,10 +32,11 @@ resolver="8.8.8.8"
 alwaysFailingDomain="dnssec-failed.org"
 recordType="SOA"
 verbose=0
+cmd_anycast="$DNSSEC_CMD_ANYCAST"
 
 usage() {
     cat - >&2 << _EOT_
-usage $0 -z <zone> [-w <warning %>] [-c <critical %>] [-r <resolver>] [-f <always failing domain>] [-t <record type>] [-v]
+usage $0 -z <zone> [-w <warning %>] [-c <critical %>] [-r <resolver>] [-f <always failing domain>] [-t <record type>] [-a <anycast cmd>] [-v] [-h]
 
     -z <zone>
         specify zone to check
@@ -50,8 +52,13 @@ usage $0 -z <zone> [-w <warning %>] [-c <critical %>] [-r <resolver>] [-f <alway
     -t <DNS record type to check>
         specify a DNS record type for calculating the remaining lifetime.
         For example SOA, A, etc.
+    -a <command>
+        specify a command which is used to find out which node is serving the request.
+        Overrides: DNSSEC_CMD_ANYCAST environment variable
     -v
         enable verbose output for debugging (prints to stderr).
+    -h
+        show this help message.
 _EOT_
     exit 255
 }
@@ -66,6 +73,7 @@ while getopts ":z:w:c:r:f:h:t:v" opt; do
     f) alwaysFailingDomain=$OPTARG ;;
     t) recordType=$OPTARG ;;
     v) verbose=1 ;;
+    a) cmd_anycast=$OPTARG;;
     h) usage ;;
   esac
 done
@@ -134,6 +142,31 @@ log_verbose "Starting check for zone $zone (Type: $recordType, Resolver: $resolv
 log_verbose "Thresholds -> Warn: $warning, Crit: $critical"
 
 # ==============================================================================
+# Anycast/Backend Debugging
+# ==============================================================================
+debug_msg=""
+
+# Safely check if the anycast command string is not empty
+if [[ -n "$cmd_anycast" ]]; then
+    log_verbose "Fetching backend debug info via $cmd_anycast"
+
+    # Execute the command with safeguards for monitoring environments:
+    # 1. 'timeout 3' prevents the script from hanging indefinitely
+    # 2. '2>/dev/null' suppresses unwanted stderr messages
+    # 3. 'head -n 1' and 'tr' ensure a clean, single-line output without line breaks or quotes
+    debug_backend_out=$(timeout 3 $cmd_anycast 2>/dev/null | head -n 1 | tr -d '\r\n"')
+
+    if [[ -n "$debug_backend_out" ]]; then
+        debug_msg=" [Backend: $debug_backend_out]"
+        log_verbose "   -> Backend identified as: $debug_backend_out"
+    else
+        log_verbose "   -> No backend debug info returned or command failed/timed out."
+    fi
+else
+    log_verbose "Omitting anycast debugging."
+fi
+
+# ==============================================================================
 # Pre-Flight Checks
 # ==============================================================================
 # Check the resolver to properly validate DNSSEC at all
@@ -142,7 +175,7 @@ log_verbose "Running Pre-Flight: $cmd_resolver_check"
 checkResolverDoesDnssecValidation=$($cmd_resolver_check | grep "opcode: QUERY" | grep "status: SERVFAIL")
 
 if [[ -z $checkResolverDoesDnssecValidation ]]; then
-    echo "WARNING: Resolver seems to not validate DNSSEC signatures. [Cmd: $cmd_resolver_check]"
+    echo "WARNING: Resolver seems to not validate DNSSEC signatures. [Cmd: $cmd_resolver_check]${debug_msg}"
     exit 1
 fi
 
@@ -176,10 +209,10 @@ if [[ -z "$checkDomainResolvableWithDnssecEnabledResolver" ]] || [[ "$client_sta
     checkDomainResolvableWithDnssecValidationExplicitelyDisabled=$($cmd_resolve_cd)
 
     if [[ -n "$checkDomainResolvableWithDnssecValidationExplicitelyDisabled" ]]; then
-        echo "CRITICAL: The domain $zone can be resolved without DNSSEC (+cd), but fails with validation! (Resolver status with validation: $client_status) [Cmd: $cmd_resolve]"
+        echo "CRITICAL: The domain $zone can be resolved without DNSSEC (+cd), but fails with validation! (Resolver status with validation: $client_status) [Cmd: $cmd_resolve]${debug_msg}"
         exit 2
     else
-        echo "CRITICAL: The domain $zone cannot be resolved via $resolver at all (even with +cd). (Resolver status with validation: $client_status) [Cmd: $cmd_resolve_cd]"
+        echo "CRITICAL: The domain $zone cannot be resolved via $resolver at all (even with +cd). (Resolver status with validation: $client_status) [Cmd: $cmd_resolve_cd]${debug_msg}"
         exit 2
     fi
 fi
@@ -196,10 +229,10 @@ else
 
     if [[ -z "$checkZoneItselfIsSignedAtAll" ]]; then
         log_verbose "Answer is missing ad flag becuase zone is unsigned."
-        echo "WARNING: Zone $zone seems to be unsigned (No DS found). [Cmd: $cmd_signed]"
+        echo "WARNING: Zone $zone seems to be unsigned (No DS found). [Cmd: $cmd_signed]${debug_msg}"
         exit 1
     else
-        echo "WARNING: The domain $zone has a DS record, but the resolver did not set the 'ad' flag! Possible resolver or path misconfiguration or NTA (Negative Trust Anchor) is set for zone. (Resolver status: $client_status) [Cmd: $cmd_resolve]"
+        echo "WARNING: The domain $zone has a DS record, but the resolver did not set the 'ad' flag! Possible resolver or path misconfiguration or NTA (Negative Trust Anchor) is set for zone. (Resolver status: $client_status) [Cmd: $cmd_resolve]${debug_msg}"
         exit 1
     fi
 fi
@@ -213,7 +246,7 @@ log_verbose "Extracting RRSIGs from the previous query..."
 rrsigEntries=$( echo "$raw_rec_output" | grep RRSIG )
 
 if [[ -z $rrsigEntries ]]; then
-        echo "CRITICAL: There is no RRSIG for the $recordType of your zone. (Resolver status: $client_status) [Cmd: $cmd_resolve]"
+        echo "CRITICAL: There is no RRSIG for the $recordType of your zone. (Resolver status: $client_status) [Cmd: $cmd_resolve]${debug_msg}"
         exit 2
 else
     while read -r rrsig; do
@@ -221,14 +254,14 @@ else
         expiryDateOfSignature=$( echo "$rrsig" | awk '{print $9}')
         checkValidityOfExpirationTimestamp=$( echo "$expiryDateOfSignature" | egrep '[0-9]{14}')
         if [[ -z $checkValidityOfExpirationTimestamp ]]; then
-            echo "UNKNOWN: Something went wrong while checking the expiration of the RRSIG entry.(Resolver status: $client_status)  Raw RRSIG: $rrsig"
+            echo "UNKNOWN: Something went wrong while checking the expiration of the RRSIG entry.(Resolver status: $client_status)  Raw RRSIG: $rrsig${debug_msg}"
             exit 3
         fi
 
         inceptionDateOfSignature=$( echo "$rrsig" | awk '{print $10}')
         checkValidityOfInceptionTimestamp=$( echo "$inceptionDateOfSignature" | egrep '[0-9]{14}')
         if [[ -z $checkValidityOfInceptionTimestamp ]]; then
-            echo "UNKNOWN: Something went wrong while checking the inception date of the RRSIG entry. (Resolver status: $client_status) Raw RRSIG: $rrsig"
+            echo "UNKNOWN: Something went wrong while checking the inception date of the RRSIG entry. (Resolver status: $client_status) Raw RRSIG: $rrsig${debug_msg}"
             exit 3
         fi
 
@@ -287,9 +320,9 @@ fi
 
 # output the final result (one line with performance data)
 if [[ "$state" == "OK" ]]; then
-    echo "OK: DNSSEC signatures for $zone valid ($remaining_day_string / $minRemainingPercentage% remaining; expire at $expire_at_string) | sig_lifetime=$minRemainingLifetime sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
+    echo "OK: DNSSEC signatures for $zone valid ($remaining_day_string / $minRemainingPercentage% remaining; expire at $expire_at_string)${debug_msg} | sig_lifetime=$minRemainingLifetime sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
 else
-    echo "$state: DNSSEC signature for $zone short before expiration! ($remaining_day_string / $minRemainingPercentage% remaining) [Cmd: dig @$resolver $recordType $zone +dnssec] | sig_lifetime=$minRemainingLifetime sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
+    echo "$state: DNSSEC signature for $zone short before expiration! ($remaining_day_string / $minRemainingPercentage% remaining) [Cmd: dig @$resolver $recordType $zone +dnssec]${debug_msg} | sig_lifetime=$minRemainingLifetime sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
 fi
 
 exit $exit_code

@@ -55,6 +55,7 @@ usage $0 -z <zone> [-w <warning %>] [-c <critical %>] [-r <resolver>] [-f <alway
     -a <command>
         specify a command which is used to find out which node is serving the request.
         Overrides: DNSSEC_CMD_ANYCAST environment variable
+        Note: https://github.com/epicade/check_dnssec_chain uses the same variable for convenience reasons
     -v
         enable verbose output for debugging (prints to stderr).
     -h

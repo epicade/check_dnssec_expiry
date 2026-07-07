@@ -16,11 +16,23 @@
 # This script is originally based on:
 # https://github.com/mrimann/check_dnssec_expiry/tree/3125050d62566dc8ea6f35aaa949e1988713100e
 #
-# * Modified to fix time/percentage calculation logic and min/max RRSIG bugs.
+# Modifications and enhancements:
+# * Added support for absolute time thresholds (days, hours, minutes, seconds) alongside percentages.
+# * Fixed time/percentage calculation logic to dynamically evaluate the actual signature lifetime.
+# * Resolved min/max RRSIG evaluation bugs to ensure safe monitoring during key rollovers.
+# * Added verbose (-v) logging and inline command-debugging output for Nagios alerts.
+
+# Default values
+warning="10d"
+critical="5d"
+resolver="8.8.8.8"
+alwaysFailingDomain="dnssec-failed.org"
+recordType="SOA"
+verbose=0
 
 usage() {
     cat - >&2 << _EOT_
-usage $0 -z <zone> [-w <warning %>] [-c <critical %>] [-r <resolver>] [-f <always failing domain>]
+usage $0 -z <zone> [-w <warning %>] [-c <critical %>] [-r <resolver>] [-f <always failing domain>] [-t <record type>] [-v]
 
     -z <zone>
         specify zone to check
@@ -36,35 +48,32 @@ usage $0 -z <zone> [-w <warning %>] [-c <critical %>] [-r <resolver>] [-f <alway
     -t <DNS record type to check>
         specify a DNS record type for calculating the remaining lifetime.
         For example SOA, A, etc.
+    -v
+        enable verbose output for debugging (prints to stderr).
 _EOT_
     exit 255
 }
 
 # Parse the input options
-while getopts ":z:w:c:r:f:h:t:" opt; do
+while getopts ":z:w:c:r:f:h:t:v" opt; do
   case $opt in
-    z)
-      zone=$OPTARG
-      ;;
-    w)
-      warning=$OPTARG
-      ;;
-    c)
-      critical=$OPTARG
-      ;;
-    r)
-      resolver=$OPTARG
-      ;;
-    f)
-      alwaysFailingDomain=$OPTARG
-      ;;
-    t)
-      recordType=$OPTARG
-      ;;
-    h)
-      usage ;;
+    z) zone=$OPTARG ;;
+    w) warning=$OPTARG ;;
+    c) critical=$OPTARG ;;
+    r) resolver=$OPTARG ;;
+    f) alwaysFailingDomain=$OPTARG ;;
+    t) recordType=$OPTARG ;;
+    v) verbose=1 ;;
+    h) usage ;;
   esac
 done
+
+# Helper function for verbose logging
+log_verbose() {
+    if [[ "$verbose" -eq 1 ]]; then
+        echo "VERBOSE: $1" >&2
+    fi
+}
 
 # parse the threshold string to separate percentage and absolute time
 parse_threshold() {
@@ -105,107 +114,99 @@ calculate_remaining_time_string() {
 # Check if dig is available at all - fail hard if not
 pathToDig=$( which dig )
 if [[ ! -e $pathToDig ]]; then
-    echo "No executable of dig found, cannot proceed without dig. Sorry!"
-    exit 1
+    echo "UNKNOWN: No executable of dig found, cannot proceed without dig."
+    exit 3
 fi
 
 # Check if we got a zone to validate - fail hard if not
 if [[ -z $zone ]]; then
-    echo "Missing zone to test - please provide a zone via the -z parameter."
+    echo "UNKNOWN: Missing zone to test - please provide a zone via the -z parameter."
     usage
-    exit 3
-fi
-
-# Check if we got warning/critical percentage values, use defaults if not
-if [[ -z $warning ]]; then
-    warning="10d"
-fi
-if [[ -z $critical ]]; then
-    critical="5d"
 fi
 
 # Parse thresholds to separate seconds and percentages
 read warn_pct warn_sec <<< $(parse_threshold "$warning")
 read crit_pct crit_sec <<< $(parse_threshold "$critical")
 
-# Use Google's 8.8.8.8 resolver as fallback if none is provided
-if [[ -z $resolver ]]; then
-    resolver="8.8.8.8"
-fi
+log_verbose "Starting check for zone $zone (Type: $recordType, Resolver: $resolver)"
+log_verbose "Thresholds -> Warn: $warning, Crit: $critical"
 
-if [[ -z $alwaysFailingDomain ]]; then
-    alwaysFailingDomain="dnssec-failed.org"
-fi
+# Check the resolver to properly validate DNSSEC at all
+cmd_resolver_check="dig +nocmd +nostats +noquestion $alwaysFailingDomain @${resolver}"
+log_verbose "Running Pre-Flight: $cmd_resolver_check"
+checkResolverDoesDnssecValidation=$($cmd_resolver_check | grep "opcode: QUERY" | grep "status: SERVFAIL")
 
-# Use SOA record type as fallback
-if [[ -z $recordType ]]; then
-        recordType="SOA"
-fi
-
-# Check the resolver to properly validate DNSSEC at all (if he doesn't, every further test is futile and a waste of bandwith)
-checkResolverDoesDnssecValidation=$(dig +nocmd +nostats +noquestion $alwaysFailingDomain @${resolver} | grep "opcode: QUERY" | grep "status: SERVFAIL")
 if [[ -z $checkResolverDoesDnssecValidation ]]; then
-    echo "WARNING: Resolver seems to not validate DNSSEC signatures - going further seems hopeless right now."
+    echo "WARNING: Resolver seems to not validate DNSSEC signatures. [Cmd: $cmd_resolver_check]"
     exit 1
 fi
 
 # Check if the resolver delivers an answer for the domain to test
-checkDomainResolvableWithDnssecEnabledResolver=$(dig +short @${resolver} $recordType $zone)
-if [[ -z $checkDomainResolvableWithDnssecEnabledResolver ]]; then
+cmd_resolve="dig +short @${resolver} $recordType $zone"
+log_verbose "Testing domain resolution: $cmd_resolve"
+checkDomainResolvableWithDnssecEnabledResolver=$($cmd_resolve)
 
-    checkDomainResolvableWithDnssecValidationExplicitelyDisabled=$(dig +short @${resolver} $recordType $zone +cd)
+if [[ -z $checkDomainResolvableWithDnssecEnabledResolver ]]; then
+    cmd_resolve_cd="dig +short @${resolver} $recordType $zone +cd"
+    checkDomainResolvableWithDnssecValidationExplicitelyDisabled=$($cmd_resolve_cd)
 
     if [[ ! -z $checkDomainResolvableWithDnssecValidationExplicitelyDisabled ]]; then
-        echo "CRITICAL: The domain $zone can be resolved without DNSSEC validation - but will fail on resolvers that do validate DNSSEC."
+        echo "CRITICAL: The domain $zone can be resolved without DNSSEC (+cd), but fails with validation! Signatures likely broken. [Cmd: $cmd_resolve]"
         exit 2
     else
-        echo "CRITICAL: The domain $zone cannot be resolved via $resolver as resolver while DNSSEC validation is active."
+        echo "CRITICAL: The domain $zone cannot be resolved via $resolver at all (even with +cd). Domain offline? [Cmd: $cmd_resolve_cd]"
         exit 2
     fi
 fi
 
 # Check if the domain is DNSSEC signed at all
-# (and emerge a WARNING in that case, since this check is about testing DNSSEC being "present" and valid which is not the case for an unsigned zone)
-checkZoneItselfIsSignedAtAll=$( dig $zone @$resolver DS +short )
+cmd_signed="dig $zone @$resolver DS +short"
+log_verbose "Checking if zone is signed: $cmd_signed"
+checkZoneItselfIsSignedAtAll=$($cmd_signed)
+
 if [[ -z $checkZoneItselfIsSignedAtAll ]]; then
-    echo "WARNING: Zone $zone seems to be unsigned itself (= resolvable, but no DNSSEC involved at all)"
+    echo "WARNING: Zone $zone seems to be unsigned (No DS found). [Cmd: $cmd_signed]"
     exit 1
 fi
 
 # Check if there are multiple RRSIG responses and check them one after the other
 now=$(date +"%s")
-rrsigEntries=$( dig @$resolver $recordType $zone +dnssec | grep RRSIG )
+cmd_rrsig="dig @$resolver $recordType $zone +dnssec"
+log_verbose "Fetching RRSIGs: $cmd_rrsig"
+rrsigEntries=$( $cmd_rrsig | grep RRSIG )
+
 if [[ -z $rrsigEntries ]]; then
-        echo "CRITICAL: There is no RRSIG for the $recordType of your zone."
+        echo "CRITICAL: There is no RRSIG for the $recordType of your zone. [Cmd: $cmd_rrsig]"
         exit 2
 else
     while read -r rrsig; do
         # Get the RRSIG entry and extract the date out of it
-        expiryDateOfSignature=$( echo $rrsig | awk '{print $9}')
-        checkValidityOfExpirationTimestamp=$( echo $expiryDateOfSignature | egrep '[0-9]{14}')
+        expiryDateOfSignature=$( echo "$rrsig" | awk '{print $9}')
+        checkValidityOfExpirationTimestamp=$( echo "$expiryDateOfSignature" | egrep '[0-9]{14}')
         if [[ -z $checkValidityOfExpirationTimestamp ]]; then
-            echo "UNKNOWN: Something went wrong while checking the expiration of the RRSIG entry - investigate please".
+            echo "UNKNOWN: Something went wrong while checking the expiration of the RRSIG entry. Raw RRSIG: $rrsig"
             exit 3
         fi
 
-        inceptionDateOfSignature=$( echo $rrsig | awk '{print $10}')
-        checkValidityOfInceptionTimestamp=$( echo $inceptionDateOfSignature | egrep '[0-9]{14}')
+        inceptionDateOfSignature=$( echo "$rrsig" | awk '{print $10}')
+        checkValidityOfInceptionTimestamp=$( echo "$inceptionDateOfSignature" | egrep '[0-9]{14}')
         if [[ -z $checkValidityOfInceptionTimestamp ]]; then
-            echo "UNKNOWN: Something went wrong while checking the inception date of the RRSIG entry - investigate please".
+            echo "UNKNOWN: Something went wrong while checking the inception date of the RRSIG entry. Raw RRSIG: $rrsig"
             exit 3
         fi
 
-        # Fiddle out the expiry and inceptiondate of the signature to have a base to do some calculations afterwards
+        log_verbose "Found RRSIG: Inception $inceptionDateOfSignature -> Expiry $expiryDateOfSignature"
+
+        # Fiddle out the expiry and inceptiondate of the signature
         expiryDateAsString="${expiryDateOfSignature:0:4}-${expiryDateOfSignature:4:2}-${expiryDateOfSignature:6:2} ${expiryDateOfSignature:8:2}:${expiryDateOfSignature:10:2}:00"
         expiryDateOfSignatureAsUnixTime=$( date -u -d "$expiryDateAsString" +"%s" 2>/dev/null )
         if [[ $? -ne 0 ]]; then
-            # if we come to this place, something must have gone wrong converting the date-string. This can happen as e.g. MacOS X and Linux don't behave the same way in this topic...
             expiryDateOfSignatureAsUnixTime=$( date -j -u -f "%Y-%m-%d %T" "$expiryDateAsString" +"%s" )
         fi
+        
         inceptionDateAsString="${inceptionDateOfSignature:0:4}-${inceptionDateOfSignature:4:2}-${inceptionDateOfSignature:6:2} ${inceptionDateOfSignature:8:2}:${inceptionDateOfSignature:10:2}:00"
         inceptionDateOfSignatureAsUnixTime=$( date -u -d "$inceptionDateAsString" +"%s" 2>/dev/null )
         if [[ $? -ne 0 ]]; then
-            # if we come to this place, something must have gone wrong converting the date-string. This can happen as e.g. MacOS X and Linux don't behave the same way in this topic...
             inceptionDateOfSignatureAsUnixTime=$( date -j -u -f "%Y-%m-%d %T" "$inceptionDateAsString" +"%s" )
         fi
 
@@ -215,7 +216,6 @@ else
         remainingPercentage=$( expr "100" \* $remainingLifetimeOfSignature / $totalLifetime)
 
         # store the result of this single RRSIG's check
-        # ensure we track the SHORTEST remaining lifetime in case of multiple signatures
         if [[ -z $minRemainingLifetime || $remainingLifetimeOfSignature -lt $minRemainingLifetime ]]; then
             minRemainingLifetime=$remainingLifetimeOfSignature
             minRemainingPercentage=$remainingPercentage
@@ -228,18 +228,18 @@ expire_at=$(($expire_at+minRemainingLifetime))
 expire_at_string=$(date -u -d @${expire_at} +"%c")
 remaining_day_string=$(calculate_remaining_time_string $minRemainingLifetime)
 
-# determine if we need to alert, and if so, how loud to cry, depending on warning/critial threshholds provided
+log_verbose "Evaluation: Shortest remaining lifetime is $remaining_day_string ($minRemainingPercentage%)"
+
+# determine if we need to alert
 state="OK"
 exit_code=0
 
-# evaluate critical thresholds first
 if [[ $crit_pct -gt 0 && $minRemainingPercentage -lt $crit_pct ]]; then
     state="CRITICAL"
     exit_code=2
 elif [[ $crit_sec -gt 0 && $minRemainingLifetime -lt $crit_sec ]]; then
     state="CRITICAL"
     exit_code=2
-# evaluate warning thresholds
 elif [[ $warn_pct -gt 0 && $minRemainingPercentage -lt $warn_pct ]]; then
     state="WARNING"
     exit_code=1
@@ -248,11 +248,11 @@ elif [[ $warn_sec -gt 0 && $minRemainingLifetime -lt $warn_sec ]]; then
     exit_code=1
 fi
 
-# output the final result
+# output the final result (one line with performance data)
 if [[ "$state" == "OK" ]]; then
-    echo "OK: DNSSEC signatures for $zone seem to be valid and not expired ($remaining_day_string / $minRemainingPercentage% remaining; expire at $expire_at_string) | sig_lifetime=$minRemainingLifetime  sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
+    echo "OK: DNSSEC signatures for $zone valid ($remaining_day_string / $minRemainingPercentage% remaining; expire at $expire_at_string) | sig_lifetime=$minRemainingLifetime sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
 else
-    echo "$state: DNSSEC signature for $zone is short before expiration! ($remaining_day_string / $minRemainingPercentage% remaining; expire at $expire_at_string) | sig_lifetime=$minRemainingLifetime  sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
+    echo "$state: DNSSEC signature for $zone short before expiration! ($remaining_day_string / $minRemainingPercentage% remaining) [Cmd: dig @$resolver $recordType $zone +dnssec] | sig_lifetime=$minRemainingLifetime sig_lifetime_percentage=$minRemainingPercentage%;$warning;$critical"
 fi
 
 exit $exit_code

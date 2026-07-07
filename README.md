@@ -23,7 +23,7 @@ It covers the following cases:
 ## New Features in this Fork
 
 - **Absolute Time Thresholds:** Added support for absolute time thresholds (days `d`, hours `h`, minutes `m`, seconds `s`) alongside the legacy percentages (`%`).
-- **Robust Anycast Debugging:** Added the `-a` flag and `DNSSEC_CMD_ANYCAST` environment variable to fetch backend node debug info (e.g., via NSID) safely, ensuring monitoring systems don't hang.
+- **Robust Anycast Debugging:** Added the `-a` flag and `DNSSEC_CMD_ANYCAST` environment variable to fetch backend node debug info (e.g., via NSID) safely, ensuring monitoring systems don't hang. You can use the `${resolver}` variable in your command string to dynamically inject the IP of the tested resolver.
 - **Enhanced Validation:** Now explicitly validates the `ad` (authenticated data) flag in the header to ensure the answer is truly DNSSEC signed. 
 - **Monitoring Output:** Added the status code of `dig` to the monitoring one-liner.
 - **Bugfixes:** Fixed time/percentage calculation logic to dynamically evaluate the actual signature lifetime and resolved min/max RRSIG evaluation bugs to ensure safe monitoring during key rollovers.
@@ -169,7 +169,7 @@ The script can also be used as-is as a data source for a Zabbix server external 
 | `-r` | Sets the resolver to use | no | `8.8.8.8` |
 | `-f` | Sets the always failing domain (used to verify the proper function of the resolving server) | no | `dnssec-failed.org` |
 | `-t` | Sets the DNS record type to validate, e.g. "A" | no | `SOA` |
-| `-a` | Sets a command to identify the anycast backend node. Overrides `DNSSEC_CMD_ANYCAST`. | no | n/a |
+| `-a` | Sets a command to identify the anycast backend node. Overrides `DNSSEC_CMD_ANYCAST`. Use the variable `${resolver}` in your string to dynamically query the same IP passed via `-r`. | no | n/a |
 | `-v` | Enables verbose output for debugging (prints to stderr). | no | n/a |
 
 ## TODO:

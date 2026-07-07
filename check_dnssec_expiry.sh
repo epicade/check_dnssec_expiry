@@ -154,7 +154,7 @@ if [[ -n "$cmd_anycast" ]]; then
     # 1. 'timeout 3' prevents the script from hanging indefinitely
     # 2. '2>/dev/null' suppresses unwanted stderr messages
     # 3. 'head -n 1' and 'tr' ensure a clean, single-line output without line breaks or quotes
-    debug_backend_out=$(timeout 3 $cmd_anycast 2>/dev/null | head -n 1 | tr -d '\r\n"')
+    debug_backend_out=$(resolver="$resolver" timeout 3 bash -c "$cmd_anycast" 2>/dev/null | head -n 1 | tr -d '\r\n"')
 
     if [[ -n "$debug_backend_out" ]]; then
         debug_msg=" [Backend: $debug_backend_out]"
@@ -163,7 +163,7 @@ if [[ -n "$cmd_anycast" ]]; then
         log_verbose "   -> No backend debug info returned or command failed/timed out."
     fi
 else
-    log_verbose "Omitting anycast debugging."
+    log_verbose "Omitting anycast debugging. Because -a or DNSSEC_CMD_ANYCAST is not set."
 fi
 
 # ==============================================================================

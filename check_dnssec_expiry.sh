@@ -21,6 +21,7 @@
 # * Fixed time/percentage calculation logic to dynamically evaluate the actual signature lifetime.
 # * Resolved min/max RRSIG evaluation bugs to ensure safe monitoring during key rollovers.
 # * Added verbose (-v) logging and inline command-debugging output for Nagios alerts.
+# * added status code of dig to monitoring one liner
 
 # Default values
 warning="10d"
@@ -131,6 +132,9 @@ read crit_pct crit_sec <<< $(parse_threshold "$critical")
 log_verbose "Starting check for zone $zone (Type: $recordType, Resolver: $resolver)"
 log_verbose "Thresholds -> Warn: $warning, Crit: $critical"
 
+# ==============================================================================
+# Pre-Flight Checks
+# ==============================================================================
 # Check the resolver to properly validate DNSSEC at all
 cmd_resolver_check="dig +nocmd +nostats +noquestion $alwaysFailingDomain @${resolver}"
 log_verbose "Running Pre-Flight: $cmd_resolver_check"
@@ -142,19 +146,30 @@ if [[ -z $checkResolverDoesDnssecValidation ]]; then
 fi
 
 # Check if the resolver delivers an answer for the domain to test
-cmd_resolve="dig +short @${resolver} $recordType $zone"
-log_verbose "Testing domain resolution: $cmd_resolve"
-checkDomainResolvableWithDnssecEnabledResolver=$($cmd_resolve)
+# remove short and grep for status and output
+cmd_resolve="dig @${resolver} $recordType $zone +dnssec"
+log_verbose "Fetching data and status in one go: $cmd_resolve"
+raw_rec_output=$($cmd_resolve 2>&1)
+
+# Parse Status
+if [[ "$raw_rec_output" == *";; connection timed out"* ]] || [[ "$raw_rec_output" == *"network error"* ]]; then
+    client_status="TIMEOUT"
+else
+    client_status=$(echo "$raw_rec_output" | grep -o "status: [A-Z]*" | awk '{print $2}')
+fi
+log_verbose "Resolver answered with status: ${client_status}."
+
+checkDomainResolvableWithDnssecEnabledResolver=$(echo "$raw_rec_output" | grep -v "^;" | grep -v "^$" | grep -v "RRSIG")
 
 if [[ -z $checkDomainResolvableWithDnssecEnabledResolver ]]; then
     cmd_resolve_cd="dig +short @${resolver} $recordType $zone +cd"
     checkDomainResolvableWithDnssecValidationExplicitelyDisabled=$($cmd_resolve_cd)
 
     if [[ ! -z $checkDomainResolvableWithDnssecValidationExplicitelyDisabled ]]; then
-        echo "CRITICAL: The domain $zone can be resolved without DNSSEC (+cd), but fails with validation! Signatures likely broken. [Cmd: $cmd_resolve]"
+        echo "CRITICAL: The domain $zone can be resolved without DNSSEC (+cd), but fails with validation! (Resolver status with validation: $client_status) [Cmd: $cmd_resolve]"
         exit 2
     else
-        echo "CRITICAL: The domain $zone cannot be resolved via $resolver at all (even with +cd). Domain offline? [Cmd: $cmd_resolve_cd]"
+        echo "CRITICAL: The domain $zone cannot be resolved via $resolver at all (even with +cd). (Resolver status with validation: $client_status) [Cmd: $cmd_resolve_cd]"
         exit 2
     fi
 fi
@@ -169,14 +184,16 @@ if [[ -z $checkZoneItselfIsSignedAtAll ]]; then
     exit 1
 fi
 
+# ==============================================================================
+# Validation
+# ==============================================================================
 # Check if there are multiple RRSIG responses and check them one after the other
 now=$(date +"%s")
-cmd_rrsig="dig @$resolver $recordType $zone +dnssec"
-log_verbose "Fetching RRSIGs: $cmd_rrsig"
-rrsigEntries=$( $cmd_rrsig | grep RRSIG )
+log_verbose "Extracting RRSIGs from the previous query..."
+rrsigEntries=$( echo "$raw_rec_output" | grep RRSIG )
 
 if [[ -z $rrsigEntries ]]; then
-        echo "CRITICAL: There is no RRSIG for the $recordType of your zone. [Cmd: $cmd_rrsig]"
+        echo "CRITICAL: There is no RRSIG for the $recordType of your zone. (Resolver status: $client_status) [Cmd: $cmd_resolve]"
         exit 2
 else
     while read -r rrsig; do
@@ -184,14 +201,14 @@ else
         expiryDateOfSignature=$( echo "$rrsig" | awk '{print $9}')
         checkValidityOfExpirationTimestamp=$( echo "$expiryDateOfSignature" | egrep '[0-9]{14}')
         if [[ -z $checkValidityOfExpirationTimestamp ]]; then
-            echo "UNKNOWN: Something went wrong while checking the expiration of the RRSIG entry. Raw RRSIG: $rrsig"
+            echo "UNKNOWN: Something went wrong while checking the expiration of the RRSIG entry.(Resolver status: $client_status)  Raw RRSIG: $rrsig"
             exit 3
         fi
 
         inceptionDateOfSignature=$( echo "$rrsig" | awk '{print $10}')
         checkValidityOfInceptionTimestamp=$( echo "$inceptionDateOfSignature" | egrep '[0-9]{14}')
         if [[ -z $checkValidityOfInceptionTimestamp ]]; then
-            echo "UNKNOWN: Something went wrong while checking the inception date of the RRSIG entry. Raw RRSIG: $rrsig"
+            echo "UNKNOWN: Something went wrong while checking the inception date of the RRSIG entry. (Resolver status: $client_status) Raw RRSIG: $rrsig"
             exit 3
         fi
 
